@@ -1,0 +1,28 @@
+SPACE INVADERS - LABORATORIO 01
+
+1. Abra esta carpeta como proyecto en PyCharm.
+2. Configure Python 3.13 como interprete y permita que PyCharm cree el entorno .venv.
+3. Abra la Terminal de PyCharm y ejecute:
+
+   python -m pip install -r requirements.txt
+
+4. Para comprobar los puntos 3 y 4 del laboratorio, abra
+   paso_4_ventana.py, haga clic derecho y elija Run 'paso_4_ventana'.
+   Debe aparecer una ventana de 800 x 600 con el fondo. Cierrela con la X.
+5. Para comprobar los puntos 6 y 7, abra main.py, haga clic derecho dentro
+   del codigo y elija Run 'main'.
+
+CONTROLES
+- Flecha izquierda y derecha: mover la nave.
+- Espacio: disparar.
+- R: reiniciar despues de perder.
+- Esc: salir.
+
+MEJORAS MINIMAS REALIZADAS
+- Movimiento fluido e independiente de la velocidad de la computadora (60 FPS).
+- Recursos localizados correctamente aunque el proyecto se abra desde otra carpeta.
+- Sonidos cargados una sola vez para evitar trabajo repetido.
+- Comparaciones de estados corregidas con ==.
+- Limites calculados con el ancho real de las imagenes.
+- Reinicio con R y salida con Esc.
+- Instrucciones visibles dentro del juego.
