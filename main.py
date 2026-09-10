@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import random
 
 import pygame
@@ -10,9 +11,13 @@ HUD_HEIGHT = 68
 BASE_PLAYER_SPEED = 5
 TURBO_PLAYER_SPEED = 10
 TURBO_DURATION_MS = 8000
+UPGRADE_DURATION_MS = 10000
 TRANSFORM_DURATION_MS = 1200
 POWERUP_FALL_SPEED = 2
 EXPLOSION_FRAME_MS = 85
+NORMAL_SHOT_COOLDOWN_MS = 240
+UPGRADE_SHOT_COOLDOWN_MS = 650
+BLAST_RADIUS = 115
 
 ROOT = Path(__file__).resolve().parent
 FONT_PATH = ROOT / "assets" / "fonts" / "PixelifySans.ttf"
@@ -108,6 +113,8 @@ player_bottom = HEIGHT - 40
 bullet_x, bullet_y = 0, 480
 bullet_speed = 10
 bullet_state = "ready"
+bullet_explosive = False
+last_shot_at = -1000
 
 score = 0
 lives = 3
@@ -119,10 +126,12 @@ enemies = []
 wave_enemy_count = 0
 formation_direction = 1
 turbo_until = 0
+upgrade_until = 0
 player_upgraded = False
 transform_start = 0
 transform_until = 0
 explosions = []
+blast_effects = []
 powerups = []
 
 
@@ -174,7 +183,8 @@ def reset_powerups():
 def reset_game():
     global player_center_x, bullet_x, bullet_y, bullet_state
     global score, lives, level, game_state, state_until
-    global turbo_until, player_upgraded, transform_start, transform_until
+    global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
+    global bullet_explosive, last_shot_at
 
     player_center_x = WIDTH // 2
     bullet_x, bullet_y = 0, 480
@@ -183,9 +193,13 @@ def reset_game():
     game_state = "playing"
     state_until = 0
     turbo_until = 0
+    upgrade_until = 0
     player_upgraded = False
     transform_start = transform_until = 0
+    bullet_explosive = False
+    last_shot_at = -1000
     explosions.clear()
+    blast_effects.clear()
     create_wave()
     reset_powerups()
 
@@ -217,7 +231,8 @@ def draw_hud(now):
         seconds = max(1, (turbo_until - now + 999) // 1000)
         draw_badge(12, flash_img, f"TURBO {seconds}s", YELLOW)
     if player_upgraded:
-        draw_badge(WIDTH - 170, question_img, "NAVE +", PURPLE)
+        seconds = max(1, (upgrade_until - now + 999) // 1000)
+        draw_badge(WIDTH - 182, question_img, f"MEGA {seconds}s", PURPLE)
 
 
 def draw_badge(x, image, text, color):
@@ -252,8 +267,11 @@ def get_bullet_rect():
 
 def draw_bullet():
     screen.blit(bullet_img, get_bullet_rect())
+    trail_color = PURPLE if bullet_explosive else CYAN
+    if bullet_explosive:
+        pygame.draw.circle(screen, PURPLE, (round(bullet_x), round(bullet_y) - 8), 12, 2)
     for offset, size in ((8, 5), (20, 4), (31, 3), (41, 2)):
-        pygame.draw.rect(screen, CYAN, (round(bullet_x - size / 2), round(bullet_y + offset), size, size))
+        pygame.draw.rect(screen, trail_color, (round(bullet_x - size / 2), round(bullet_y + offset), size, size))
 
 
 def update_enemies():
@@ -297,12 +315,17 @@ def draw_powerups():
 
 
 def update_powerups(now, ship_rect):
-    global turbo_until, player_upgraded, transform_start, transform_until
+    global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
     for powerup in powerups:
         if not powerup["active"]:
             if powerup["kind"] == "turbo" and now >= powerup["respawn"]:
                 powerup.update(x=float(random.randint(50, WIDTH - 96)), y=float(HUD_HEIGHT + 10), active=True)
-            elif powerup["kind"] == "upgrade" and not player_upgraded and now >= powerup["respawn"]:
+            elif (
+                powerup["kind"] == "upgrade"
+                and not player_upgraded
+                and now >= transform_until
+                and now >= powerup["respawn"]
+            ):
                 powerup.update(x=float(random.randint(50, WIDTH - 96)), y=float(HUD_HEIGHT + 10), active=True)
             continue
 
@@ -316,8 +339,10 @@ def update_powerups(now, ship_rect):
                 powerup["respawn"] = turbo_until + 2500
             else:
                 player_upgraded = True
+                upgrade_until = now + UPGRADE_DURATION_MS
                 transform_start = now
                 transform_until = now + TRANSFORM_DURATION_MS
+                powerup["respawn"] = upgrade_until + 3500
         elif powerup["y"] > HEIGHT:
             powerup["active"] = False
             powerup["respawn"] = now + 1800
@@ -338,10 +363,52 @@ def draw_explosions(now):
     explosions[:] = active
 
 
+def add_blast(center, now):
+    blast_effects.append({"center": center, "start": now})
+
+
+def draw_blasts(now):
+    """Expande un aro que permite entender el alcance del disparo mejorado."""
+    active = []
+    for blast in blast_effects:
+        elapsed = now - blast["start"]
+        if elapsed < 360:
+            progress = elapsed / 360
+            radius = max(8, round(BLAST_RADIUS * progress))
+            alpha = round(210 * (1 - progress))
+            layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            pygame.draw.circle(layer, (*PURPLE, alpha), blast["center"], radius, 3)
+            pygame.draw.circle(layer, (*CYAN, alpha // 2), blast["center"], max(3, radius - 8), 2)
+            screen.blit(layer, (0, 0))
+            active.append(blast)
+    blast_effects[:] = active
+
+
+def destroy_enemies_at_impact(direct_hit, center, explosive, now):
+    """La nave grande daña también a enemigos dentro de 115 píxeles."""
+    global score
+    defeated = []
+    for enemy in enemies:
+        target_center = enemy_rect(enemy).center
+        in_radius = math.hypot(target_center[0] - center[0], target_center[1] - center[1]) <= BLAST_RADIUS
+        if enemy is direct_hit or (explosive and in_radius):
+            defeated.append(enemy)
+
+    for enemy in defeated:
+        enemies.remove(enemy)
+        add_explosion(enemy_rect(enemy).center, now)
+        score += 10
+
+    if explosive:
+        add_blast(center, now)
+    return len(defeated)
+
+
 def lose_life():
-    global lives, bullet_state, bullet_y, game_state
+    global lives, bullet_state, bullet_y, bullet_explosive, game_state
     lives -= 1
     bullet_state, bullet_y = "ready", 480
+    bullet_explosive = False
     if lives <= 0:
         game_state = "game_over"
     else:
@@ -375,15 +442,24 @@ while running:
             elif event.key == pygame.K_r and game_state == "game_over":
                 reset_game()
             elif event.key == pygame.K_SPACE and bullet_state == "ready" and game_state == "playing":
-                bullet_x = player_center_x
-                bullet_y = player_rect(now).top
-                bullet_state = "fire"
-                laser_sound.play()
+                shot_cooldown = UPGRADE_SHOT_COOLDOWN_MS if player_upgraded else NORMAL_SHOT_COOLDOWN_MS
+                if now - last_shot_at >= shot_cooldown:
+                    bullet_x = player_center_x
+                    bullet_y = player_rect(now).top
+                    bullet_state = "fire"
+                    bullet_explosive = player_upgraded
+                    last_shot_at = now
+                    laser_sound.play()
 
     if game_state == "level_clear" and now >= state_until:
         level += 1
         create_wave()
         game_state = "playing"
+
+    if player_upgraded and now >= upgrade_until:
+        player_upgraded = False
+        transform_start = now
+        transform_until = now + TRANSFORM_DURATION_MS
 
     screen.blit(background, (0, 0))
 
@@ -406,22 +482,25 @@ while running:
             shot = get_bullet_rect()
             hit_index = next((i for i, enemy in enumerate(enemies) if shot.colliderect(enemy_rect(enemy))), None)
             if hit_index is not None:
-                defeated = enemies.pop(hit_index)
-                add_explosion(enemy_rect(defeated).center, now)
+                direct_hit = enemies[hit_index]
+                impact_center = enemy_rect(direct_hit).center
+                destroy_enemies_at_impact(direct_hit, impact_center, bullet_explosive, now)
                 explosion_sound.play()
-                score += 10
                 bullet_state, bullet_y = "ready", 480
+                bullet_explosive = False
                 if not enemies:
                     game_state = "level_clear"
                     state_until = now + 1600
             elif bullet_y <= -bullet_img.get_height():
                 bullet_state, bullet_y = "ready", 480
+                bullet_explosive = False
 
     draw_powerups()
     draw_enemies()
     if bullet_state == "fire":
         draw_bullet()
     draw_explosions(now)
+    draw_blasts(now)
     draw_player(now)
 
     if game_state == "level_clear":
