@@ -9,6 +9,7 @@ from pygame import mixer
 
 WIDTH, HEIGHT, FPS = 800, 600, 60
 HUD_HEIGHT = 68
+MAX_LIVES = 3
 BASE_PLAYER_SPEED = 5
 TURBO_PLAYER_SPEED = 10
 TURBO_DURATION_MS = 8000
@@ -18,6 +19,7 @@ POWERUP_FALL_SPEED = 2
 EXPLOSION_FRAME_MS = 85
 NORMAL_SHOT_COOLDOWN_MS = 240
 UPGRADE_SHOT_COOLDOWN_MS = 650
+PIERCING_SHOT_COOLDOWN_MS = 500
 BLAST_RADIUS = 115
 PLAYER_INVINCIBILITY_MS = 1500
 SHAKE_DURATION_MS = 320
@@ -91,6 +93,9 @@ flash_img = pygame.transform.scale(
 question_img = pygame.transform.scale(
     pygame.image.load(extra_resource("icono_pregunta.png")).convert_alpha(), (46, 46)
 )
+heart_img = pygame.transform.scale(
+    pygame.image.load(extra_resource("icono_corazon.png")).convert_alpha(), (50, 50)
+)
 
 # Ahora sí se usan los tres enemigos del paquete de sprites.
 enemy_images = [
@@ -141,6 +146,7 @@ bullet_x, bullet_y = 0, 480
 bullet_speed = 10
 bullet_state = "ready"
 bullet_explosive = False
+bullet_piercing = False
 last_shot_at = -1000
 
 score = 0
@@ -162,8 +168,11 @@ next_tension_beat = 0
 turbo_until = 0
 upgrade_until = 0
 player_upgraded = False
+upgrade_variant = None
 transform_start = 0
 transform_until = 0
+upgrade_message = ""
+upgrade_message_until = 0
 invincible_until = 0
 shake_until = 0
 explosions = []
@@ -217,6 +226,7 @@ def reset_powerups():
         [
             {"kind": "turbo", "x": 165.0, "y": 112.0, "active": True, "respawn": 0},
             {"kind": "upgrade", "x": 590.0, "y": 152.0, "active": True, "respawn": 0},
+            {"kind": "heart", "x": 0.0, "y": 0.0, "active": False, "respawn": 0},
         ]
     )
 
@@ -224,25 +234,30 @@ def reset_powerups():
 def reset_game():
     global player_center_x, bullet_x, bullet_y, bullet_state
     global score, lives, level, game_state, state_until
-    global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
-    global bullet_explosive, last_shot_at
+    global turbo_until, upgrade_until, player_upgraded, upgrade_variant
+    global transform_start, transform_until, upgrade_message, upgrade_message_until
+    global bullet_explosive, bullet_piercing, last_shot_at
     global invincible_until, shake_until
     global initials_input, pause_started
 
     player_center_x = WIDTH // 2
     bullet_x, bullet_y = 0, 480
     bullet_state = "ready"
-    score, lives, level = 0, 3, 1
+    score, lives, level = 0, MAX_LIVES, 1
     game_state = "playing"
     state_until = 0
     turbo_until = 0
     upgrade_until = 0
     player_upgraded = False
+    upgrade_variant = None
     transform_start = transform_until = 0
+    upgrade_message = ""
+    upgrade_message_until = 0
     invincible_until = shake_until = 0
     initials_input = ""
     pause_started = 0
     bullet_explosive = False
+    bullet_piercing = False
     last_shot_at = -1000
     explosions.clear()
     blast_effects.clear()
@@ -265,7 +280,7 @@ def draw_hud(now):
     hud.fill((9, 2, 27, 226))
     screen.blit(hud, (0, 0))
     pygame.draw.line(screen, (80, 38, 121), (0, HUD_HEIGHT - 1), (WIDTH, HUD_HEIGHT - 1), 2)
-    for index in range(3):
+    for index in range(MAX_LIVES):
         draw_heart(16 + index * 34, 20, index < lives)
 
     screen.blit(enemy_hud_img, (315, 18))
@@ -280,7 +295,16 @@ def draw_hud(now):
         draw_badge(12, flash_img, f"TURBO {seconds}s", YELLOW)
     if player_upgraded:
         seconds = max(1, (upgrade_until - now + 999) // 1000)
-        draw_badge(WIDTH - 182, question_img, f"MEGA {seconds}s", PURPLE)
+        variant_name = "BOMBA" if upgrade_variant == "blast" else "LÁSER"
+        draw_badge(WIDTH - 182, question_img, f"{variant_name} {seconds}s", PURPLE)
+
+    if now < upgrade_message_until:
+        notice = font_small.render(upgrade_message, True, WHITE)
+        panel = pygame.Surface((notice.get_width() + 26, 32), pygame.SRCALPHA)
+        panel.fill((62, 16, 91, 225))
+        pygame.draw.rect(panel, PURPLE, panel.get_rect(), 2)
+        panel.blit(notice, notice.get_rect(center=panel.get_rect().center))
+        screen.blit(panel, panel.get_rect(midtop=(WIDTH // 2, HUD_HEIGHT + 48)))
 
 
 def draw_badge(x, image, text, color):
@@ -317,9 +341,22 @@ def get_bullet_rect():
 
 def draw_bullet():
     screen.blit(bullet_img, get_bullet_rect())
-    trail_color = PURPLE if bullet_explosive else CYAN
+    if bullet_explosive:
+        trail_color = PURPLE
+    elif bullet_piercing:
+        trail_color = GREEN
+    else:
+        trail_color = CYAN
     if bullet_explosive:
         pygame.draw.circle(screen, PURPLE, (round(bullet_x), round(bullet_y) - 8), 12, 2)
+    elif bullet_piercing:
+        pygame.draw.line(
+            screen,
+            GREEN,
+            (round(bullet_x), round(bullet_y) - 20),
+            (round(bullet_x), round(bullet_y) + 38),
+            3,
+        )
     for offset, size in ((8, 5), (20, 4), (31, 3), (41, 2)):
         pygame.draw.rect(screen, trail_color, (round(bullet_x - size / 2), round(bullet_y + offset), size, size))
 
@@ -391,15 +428,25 @@ def draw_enemy_bullets():
         pygame.draw.rect(screen, YELLOW, (x - 1, y + 3, 2, 7))
 
 
+def powerup_image(kind):
+    if kind == "turbo":
+        return flash_img
+    if kind == "heart":
+        return heart_img
+    return question_img
+
+
 def draw_powerups():
     for powerup in powerups:
         if powerup["active"]:
-            image = flash_img if powerup["kind"] == "turbo" else question_img
+            image = powerup_image(powerup["kind"])
             screen.blit(image, (round(powerup["x"]), round(powerup["y"])))
 
 
 def update_powerups(now, ship_rect):
-    global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
+    global turbo_until, upgrade_until, player_upgraded, upgrade_variant
+    global transform_start, transform_until, upgrade_message, upgrade_message_until
+    global lives
     for powerup in powerups:
         if not powerup["active"]:
             if powerup["kind"] == "turbo" and now >= powerup["respawn"]:
@@ -411,25 +458,39 @@ def update_powerups(now, ship_rect):
                 and now >= powerup["respawn"]
             ):
                 powerup.update(x=float(random.randint(50, WIDTH - 96)), y=float(HUD_HEIGHT + 10), active=True)
+            elif powerup["kind"] == "heart" and lives < MAX_LIVES and now >= powerup["respawn"]:
+                powerup.update(x=float(random.randint(50, WIDTH - 100)), y=float(HUD_HEIGHT + 10), active=True)
             continue
 
         powerup["y"] += POWERUP_FALL_SPEED
-        image = flash_img if powerup["kind"] == "turbo" else question_img
+        image = powerup_image(powerup["kind"])
         item_rect = image.get_rect(topleft=(round(powerup["x"]), round(powerup["y"])))
         if item_rect.colliderect(ship_rect):
             powerup["active"] = False
             if powerup["kind"] == "turbo":
                 turbo_until = now + TURBO_DURATION_MS
                 powerup["respawn"] = turbo_until + 2500
-            else:
+            elif powerup["kind"] == "upgrade":
                 player_upgraded = True
+                upgrade_variant = random.choice(("blast", "piercing"))
                 upgrade_until = now + UPGRADE_DURATION_MS
                 transform_start = now
                 transform_until = now + TRANSFORM_DURATION_MS
                 powerup["respawn"] = upgrade_until + 3500
+                if upgrade_variant == "blast":
+                    upgrade_message = "MEJORA: BOMBA RADIAL"
+                else:
+                    upgrade_message = "MEJORA: LÁSER PERFORANTE"
+                upgrade_message_until = now + 1700
+            else:
+                lives = min(MAX_LIVES, lives + 1)
+                floating_texts.append(
+                    {"text": "+1 VIDA", "center": ship_rect.center, "start": now, "color": GREEN}
+                )
+                powerup["respawn"] = 0
         elif powerup["y"] > HEIGHT:
             powerup["active"] = False
-            powerup["respawn"] = now + 1800
+            powerup["respawn"] = now + (4500 if powerup["kind"] == "heart" else 1800)
 
 
 def add_explosion(center, now):
@@ -496,7 +557,7 @@ def draw_floating_texts(now):
         elapsed = now - item["start"]
         if elapsed < 720:
             progress = elapsed / 720
-            label = font_small.render(item["text"], True, YELLOW)
+            label = font_small.render(item["text"], True, item.get("color", YELLOW))
             label.set_alpha(round(255 * (1 - progress)))
             x, y = item["center"]
             screen.blit(label, label.get_rect(center=(x, y - round(progress * 38))))
@@ -520,7 +581,7 @@ def shift_timers_after_pause(delta):
     """Evita que los potenciadores y animaciones expiren mientras está pausado."""
     global turbo_until, upgrade_until, transform_start, transform_until
     global invincible_until, shake_until, last_shot_at, last_enemy_shot_at
-    global next_tension_beat, state_until
+    global next_tension_beat, state_until, upgrade_message_until
     turbo_until += delta
     upgrade_until += delta
     transform_start += delta
@@ -531,6 +592,7 @@ def shift_timers_after_pause(delta):
     last_enemy_shot_at += delta
     next_tension_beat += delta
     state_until += delta
+    upgrade_message_until += delta
     for collection in (explosions, blast_effects, floating_texts):
         for item in collection:
             item["start"] += delta
@@ -548,22 +610,34 @@ def finish_game():
         game_state = "game_over"
 
 
+def schedule_heart(now):
+    """Después de perder una vida, programa una oportunidad de recuperarla."""
+    for powerup in powerups:
+        if powerup["kind"] == "heart":
+            powerup["active"] = False
+            powerup["respawn"] = now + 2500
+            return
+
+
 def hit_player(now, formation_breached):
-    global lives, bullet_state, bullet_y, bullet_explosive, game_state
+    global lives, bullet_state, bullet_y, bullet_explosive, bullet_piercing, game_state
     global invincible_until, shake_until, player_center_x
     if now < invincible_until:
         return
     lives -= 1
     bullet_state, bullet_y = "ready", 480
     bullet_explosive = False
+    bullet_piercing = False
     enemy_bullets.clear()
     invincible_until = now + PLAYER_INVINCIBILITY_MS
     shake_until = now + SHAKE_DURATION_MS
     player_center_x = WIDTH // 2
     if lives <= 0:
         finish_game()
-    elif formation_breached:
-        create_wave()
+    else:
+        schedule_heart(now)
+        if formation_breached:
+            create_wave()
 
 
 def draw_center_panel(title, subtitle, color):
@@ -661,12 +735,18 @@ while running:
             elif event.key == pygame.K_r and game_state == "game_over":
                 reset_game()
             elif event.key == pygame.K_SPACE and bullet_state == "ready" and game_state == "playing":
-                shot_cooldown = UPGRADE_SHOT_COOLDOWN_MS if player_upgraded else NORMAL_SHOT_COOLDOWN_MS
+                if player_upgraded and upgrade_variant == "blast":
+                    shot_cooldown = UPGRADE_SHOT_COOLDOWN_MS
+                elif player_upgraded and upgrade_variant == "piercing":
+                    shot_cooldown = PIERCING_SHOT_COOLDOWN_MS
+                else:
+                    shot_cooldown = NORMAL_SHOT_COOLDOWN_MS
                 if now - last_shot_at >= shot_cooldown:
                     bullet_x = player_center_x
                     bullet_y = player_rect(now).top
                     bullet_state = "fire"
-                    bullet_explosive = player_upgraded
+                    bullet_explosive = player_upgraded and upgrade_variant == "blast"
+                    bullet_piercing = player_upgraded and upgrade_variant == "piercing"
                     last_shot_at = now
                     laser_sound.play()
 
@@ -677,6 +757,7 @@ while running:
 
     if game_state == "playing" and player_upgraded and now >= upgrade_until:
         player_upgraded = False
+        upgrade_variant = None
         transform_start = now
         transform_until = now + TRANSFORM_DURATION_MS
 
@@ -709,14 +790,17 @@ while running:
                 impact_center = enemy_rect(direct_hit).center
                 destroy_enemies_at_impact(direct_hit, impact_center, bullet_explosive, now)
                 explosion_sound.play()
-                bullet_state, bullet_y = "ready", 480
-                bullet_explosive = False
+                if not bullet_piercing or not enemies:
+                    bullet_state, bullet_y = "ready", 480
+                    bullet_explosive = False
+                    bullet_piercing = False
                 if not enemies:
                     game_state = "level_clear"
                     state_until = now + 1600
             elif bullet_y <= -bullet_img.get_height():
                 bullet_state, bullet_y = "ready", 480
                 bullet_explosive = False
+                bullet_piercing = False
 
     if game_state == "menu":
         draw_start_screen(now)
