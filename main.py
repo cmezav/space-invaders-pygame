@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import math
 import random
 
@@ -25,6 +26,13 @@ ENEMY_BULLET_SPEED = 5
 ROOT = Path(__file__).resolve().parent
 FONT_PATH = ROOT / "assets" / "fonts" / "PixelifySans.ttf"
 EXTRA_DIR = ROOT / "assets" / "sprites_extra"
+HIGH_SCORE_PATH = ROOT / "highscore.json"
+
+DIFFICULTIES = [
+    {"name": "FÁCIL", "speed": 0.80, "fire": 1.35},
+    {"name": "NORMAL", "speed": 1.00, "fire": 1.00},
+    {"name": "DIFÍCIL", "speed": 1.25, "fire": 0.72},
+]
 
 WHITE = (245, 245, 255)
 GREEN = (108, 255, 107)
@@ -114,6 +122,19 @@ font_hud = pixel_font(30)
 font_title = pixel_font(66)
 font_subtitle = pixel_font(30)
 
+
+def load_high_score():
+    try:
+        data = json.loads(HIGH_SCORE_PATH.read_text(encoding="utf-8"))
+        return max(0, int(data.get("score", 0))), str(data.get("initials", "---"))[:3].upper()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0, "---"
+
+
+def save_high_score():
+    data = {"score": high_score, "initials": high_initials}
+    HIGH_SCORE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
 player_center_x = WIDTH // 2
 player_bottom = HEIGHT - 40
 bullet_x, bullet_y = 0, 480
@@ -125,8 +146,12 @@ last_shot_at = -1000
 score = 0
 lives = 3
 level = 1
-game_state = "playing"
+game_state = "menu"
 state_until = 0
+difficulty_index = 1
+high_score, high_initials = load_high_score()
+initials_input = ""
+pause_started = 0
 
 enemies = []
 wave_enemy_count = 0
@@ -202,6 +227,7 @@ def reset_game():
     global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
     global bullet_explosive, last_shot_at
     global invincible_until, shake_until
+    global initials_input, pause_started
 
     player_center_x = WIDTH // 2
     bullet_x, bullet_y = 0, 480
@@ -214,6 +240,8 @@ def reset_game():
     player_upgraded = False
     transform_start = transform_until = 0
     invincible_until = shake_until = 0
+    initials_input = ""
+    pause_started = 0
     bullet_explosive = False
     last_shot_at = -1000
     explosions.clear()
@@ -267,7 +295,7 @@ def draw_footer():
     footer = pygame.Surface((WIDTH, 30), pygame.SRCALPHA)
     footer.fill((9, 2, 27, 205))
     screen.blit(footer, (0, HEIGHT - 30))
-    text = font_small.render("FLECHAS: MOVER   ESPACIO: DISPARAR   ESC: SALIR", True, WHITE)
+    text = font_small.render("FLECHAS: MOVER   ESPACIO: DISPARAR   P: PAUSA   ESC: SALIR", True, WHITE)
     screen.blit(text, text.get_rect(center=(WIDTH // 2, HEIGHT - 16)))
 
 
@@ -303,7 +331,8 @@ def update_enemies():
 
     remaining_ratio = len(enemies) / max(1, wave_enemy_count)
     base_speed = 2.0 + (level - 1) * 0.5
-    speed = base_speed * (1.0 + (1.0 - remaining_ratio) * 0.85)
+    speed = base_speed * DIFFICULTIES[difficulty_index]["speed"]
+    speed *= 1.0 + (1.0 - remaining_ratio) * 0.85
     movement = speed * formation_direction
     for enemy in enemies:
         enemy["x"] += movement
@@ -334,7 +363,7 @@ def update_enemy_attack(now, ship_rect):
     global last_enemy_shot_at
     if enemies:
         remaining_ratio = len(enemies) / max(1, wave_enemy_count)
-        interval = 720 + round(remaining_ratio * 650)
+        interval = (720 + round(remaining_ratio * 650)) * DIFFICULTIES[difficulty_index]["fire"]
         if now - last_enemy_shot_at >= interval:
             shooter = random.choice(enemies)
             origin = enemy_rect(shooter)
@@ -487,6 +516,38 @@ def update_music_tension(now):
         next_tension_beat = now + interval
 
 
+def shift_timers_after_pause(delta):
+    """Evita que los potenciadores y animaciones expiren mientras está pausado."""
+    global turbo_until, upgrade_until, transform_start, transform_until
+    global invincible_until, shake_until, last_shot_at, last_enemy_shot_at
+    global next_tension_beat, state_until
+    turbo_until += delta
+    upgrade_until += delta
+    transform_start += delta
+    transform_until += delta
+    invincible_until += delta
+    shake_until += delta
+    last_shot_at += delta
+    last_enemy_shot_at += delta
+    next_tension_beat += delta
+    state_until += delta
+    for collection in (explosions, blast_effects, floating_texts):
+        for item in collection:
+            item["start"] += delta
+    for powerup in powerups:
+        if not powerup["active"]:
+            powerup["respawn"] += delta
+
+
+def finish_game():
+    global game_state, initials_input
+    if score > high_score:
+        initials_input = ""
+        game_state = "initials"
+    else:
+        game_state = "game_over"
+
+
 def hit_player(now, formation_breached):
     global lives, bullet_state, bullet_y, bullet_explosive, game_state
     global invincible_until, shake_until, player_center_x
@@ -500,7 +561,7 @@ def hit_player(now, formation_breached):
     shake_until = now + SHAKE_DURATION_MS
     player_center_x = WIDTH // 2
     if lives <= 0:
-        game_state = "game_over"
+        finish_game()
     elif formation_breached:
         create_wave()
 
@@ -516,7 +577,49 @@ def draw_center_panel(title, subtitle, color):
     screen.blit(detail, detail.get_rect(center=(WIDTH // 2, 345)))
 
 
+def draw_start_screen(real_now):
+    offset_y = round(math.sin(real_now / 380) * 8)
+    title = font_title.render("SPACE INVADERS", True, CYAN)
+    shadow = font_title.render("SPACE INVADERS", True, PURPLE)
+    title_rect = title.get_rect(center=(WIDTH // 2, 148 + offset_y))
+    screen.blit(shadow, title_rect.move(4, 5))
+    screen.blit(title, title_rect)
+
+    for index, image in enumerate(enemy_images):
+        screen.blit(image, image.get_rect(center=(320 + index * 80, 235)))
+
+    difficulty = DIFFICULTIES[difficulty_index]["name"]
+    box = pygame.Surface((420, 72), pygame.SRCALPHA)
+    box.fill((12, 3, 34, 225))
+    pygame.draw.rect(box, PURPLE, box.get_rect(), 3)
+    screen.blit(box, (190, 285))
+    selector = font_subtitle.render(f"<  {difficulty}  >", True, YELLOW)
+    screen.blit(selector, selector.get_rect(center=(WIDTH // 2, 321)))
+
+    record = font_small.render(f"RÉCORD: {high_initials}  {high_score:04d}", True, GREEN)
+    start = font_subtitle.render("PRESIONA ENTER PARA JUGAR", True, WHITE)
+    hint = font_small.render("IZQUIERDA / DERECHA: DIFICULTAD", True, CYAN)
+    screen.blit(record, record.get_rect(center=(WIDTH // 2, 397)))
+    screen.blit(start, start.get_rect(center=(WIDTH // 2, 455)))
+    screen.blit(hint, hint.get_rect(center=(WIDTH // 2, 502)))
+
+
+def draw_initials_screen():
+    panel = pygame.Surface((610, 250), pygame.SRCALPHA)
+    panel.fill((12, 3, 34, 242))
+    pygame.draw.rect(panel, YELLOW, panel.get_rect(), 4)
+    screen.blit(panel, (95, 165))
+    title = font_title.render("¡NUEVO RÉCORD!", True, YELLOW)
+    prompt = font_subtitle.render("ESCRIBE TUS 3 INICIALES", True, WHITE)
+    slots = " ".join(list(initials_input.ljust(3, "_")))
+    initials = font_title.render(slots, True, CYAN)
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, 222)))
+    screen.blit(prompt, prompt.get_rect(center=(WIDTH // 2, 290)))
+    screen.blit(initials, initials.get_rect(center=(WIDTH // 2, 360)))
+
+
 reset_game()
+game_state = "menu"
 running = True
 
 while running:
@@ -529,6 +632,32 @@ while running:
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
+            elif game_state == "menu":
+                if event.key == pygame.K_LEFT:
+                    difficulty_index = (difficulty_index - 1) % len(DIFFICULTIES)
+                elif event.key == pygame.K_RIGHT:
+                    difficulty_index = (difficulty_index + 1) % len(DIFFICULTIES)
+                elif event.key == pygame.K_RETURN:
+                    reset_game()
+            elif game_state == "initials":
+                if event.key == pygame.K_BACKSPACE:
+                    initials_input = initials_input[:-1]
+                elif event.key == pygame.K_RETURN and len(initials_input) == 3:
+                    high_score = score
+                    high_initials = initials_input
+                    save_high_score()
+                    game_state = "game_over"
+                elif event.unicode and event.unicode.upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    if len(initials_input) < 3:
+                        initials_input += event.unicode.upper()
+            elif event.key == pygame.K_p and game_state == "playing":
+                pause_started = now
+                game_state = "paused"
+                mixer.music.pause()
+            elif event.key == pygame.K_p and game_state == "paused":
+                shift_timers_after_pause(now - pause_started)
+                game_state = "playing"
+                mixer.music.unpause()
             elif event.key == pygame.K_r and game_state == "game_over":
                 reset_game()
             elif event.key == pygame.K_SPACE and bullet_state == "ready" and game_state == "playing":
@@ -546,7 +675,7 @@ while running:
         create_wave()
         game_state = "playing"
 
-    if player_upgraded and now >= upgrade_until:
+    if game_state == "playing" and player_upgraded and now >= upgrade_until:
         player_upgraded = False
         transform_start = now
         transform_until = now + TRANSFORM_DURATION_MS
@@ -589,29 +718,37 @@ while running:
                 bullet_state, bullet_y = "ready", 480
                 bullet_explosive = False
 
-    draw_powerups()
-    draw_enemies()
-    draw_enemy_bullets()
-    if bullet_state == "fire":
-        draw_bullet()
-    draw_explosions(now)
-    draw_blasts(now)
-    draw_floating_texts(now)
-    draw_player(now)
+    if game_state == "menu":
+        draw_start_screen(now)
+    else:
+        display_now = pause_started if game_state == "paused" else now
+        draw_powerups()
+        draw_enemies()
+        draw_enemy_bullets()
+        if bullet_state == "fire":
+            draw_bullet()
+        draw_explosions(display_now)
+        draw_blasts(display_now)
+        draw_floating_texts(display_now)
+        draw_player(display_now)
 
-    if game_state == "level_clear":
-        draw_center_panel("¡NIVEL SUPERADO!", f"PREPARANDO OLEADA {level + 1}", GREEN)
-    elif game_state == "game_over":
-        draw_center_panel("GAME OVER", "PRESIONA R PARA REINICIAR", RED)
+        if game_state == "level_clear":
+            draw_center_panel("¡NIVEL SUPERADO!", f"PREPARANDO OLEADA {level + 1}", GREEN)
+        elif game_state == "paused":
+            draw_center_panel("PAUSA", "PRESIONA P PARA CONTINUAR", CYAN)
+        elif game_state == "initials":
+            draw_initials_screen()
+        elif game_state == "game_over":
+            draw_center_panel("GAME OVER", "PRESIONA R PARA REINICIAR", RED)
 
-    draw_hud(now)
-    draw_footer()
+        draw_hud(display_now)
+        draw_footer()
 
-    if now < shake_until:
-        snapshot = screen.copy()
-        offset = (random.randint(-7, 7), random.randint(-5, 5))
-        screen.fill(DARK)
-        screen.blit(snapshot, offset)
+        if display_now < shake_until:
+            snapshot = screen.copy()
+            offset = (random.randint(-7, 7), random.randint(-5, 5))
+            screen.fill(DARK)
+            screen.blit(snapshot, offset)
     pygame.display.flip()
 
 pygame.quit()
