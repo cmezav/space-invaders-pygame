@@ -18,6 +18,9 @@ EXPLOSION_FRAME_MS = 85
 NORMAL_SHOT_COOLDOWN_MS = 240
 UPGRADE_SHOT_COOLDOWN_MS = 650
 BLAST_RADIUS = 115
+PLAYER_INVINCIBILITY_MS = 1500
+SHAKE_DURATION_MS = 320
+ENEMY_BULLET_SPEED = 5
 
 ROOT = Path(__file__).resolve().parent
 FONT_PATH = ROOT / "assets" / "fonts" / "PixelifySans.ttf"
@@ -102,6 +105,9 @@ laser_sound = mixer.Sound(resource("laser.wav"))
 explosion_sound = mixer.Sound(resource("explosion.wav"))
 laser_sound.set_volume(0.45)
 explosion_sound.set_volume(0.45)
+# Pulso muy suave que se repite más rápido cuando quedan pocos invasores.
+tension_sound = mixer.Sound(resource("laser.wav"))
+tension_sound.set_volume(0.07)
 
 font_small = pixel_font(20)
 font_hud = pixel_font(30)
@@ -125,13 +131,19 @@ state_until = 0
 enemies = []
 wave_enemy_count = 0
 formation_direction = 1
+enemy_bullets = []
+last_enemy_shot_at = 0
+next_tension_beat = 0
 turbo_until = 0
 upgrade_until = 0
 player_upgraded = False
 transform_start = 0
 transform_until = 0
+invincible_until = 0
+shake_until = 0
 explosions = []
 blast_effects = []
+floating_texts = []
 powerups = []
 
 
@@ -148,6 +160,7 @@ def player_rect(now):
 def create_wave():
     """Cada nivel agrega enemigos y aumenta 0.5 la velocidad base."""
     global enemies, wave_enemy_count, formation_direction
+    global last_enemy_shot_at, next_tension_beat
     count = min(6 + (level - 1) * 2, 18)
     columns = min(6, count)
     rows = (count + columns - 1) // columns
@@ -168,6 +181,9 @@ def create_wave():
         )
     wave_enemy_count = len(enemies)
     formation_direction = 1
+    enemy_bullets.clear()
+    last_enemy_shot_at = pygame.time.get_ticks()
+    next_tension_beat = pygame.time.get_ticks()
 
 
 def reset_powerups():
@@ -185,6 +201,7 @@ def reset_game():
     global score, lives, level, game_state, state_until
     global turbo_until, upgrade_until, player_upgraded, transform_start, transform_until
     global bullet_explosive, last_shot_at
+    global invincible_until, shake_until
 
     player_center_x = WIDTH // 2
     bullet_x, bullet_y = 0, 480
@@ -196,10 +213,13 @@ def reset_game():
     upgrade_until = 0
     player_upgraded = False
     transform_start = transform_until = 0
+    invincible_until = shake_until = 0
     bullet_explosive = False
     last_shot_at = -1000
     explosions.clear()
     blast_effects.clear()
+    floating_texts.clear()
+    enemy_bullets.clear()
     create_wave()
     reset_powerups()
 
@@ -258,7 +278,9 @@ def draw_player(now):
         glow = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
         pygame.draw.ellipse(glow, (220, 245, 255, 92), glow.get_rect())
         screen.blit(glow, glow.get_rect(center=rect.center))
-    screen.blit(image, rect)
+    # Tras recibir daño parpadea: durante este tiempo no puede perder otra vida.
+    if now >= invincible_until or ((now // 90) % 2 == 0):
+        screen.blit(image, rect)
 
 
 def get_bullet_rect():
@@ -305,6 +327,39 @@ def draw_enemies():
 def enemy_rect(enemy):
     image = enemy_images[enemy["image"]]
     return image.get_rect(topleft=(round(enemy["x"]), round(enemy["y"])))
+
+
+def update_enemy_attack(now, ship_rect):
+    """Un invasor aleatorio dispara hacia abajo y obliga al jugador a esquivar."""
+    global last_enemy_shot_at
+    if enemies:
+        remaining_ratio = len(enemies) / max(1, wave_enemy_count)
+        interval = 720 + round(remaining_ratio * 650)
+        if now - last_enemy_shot_at >= interval:
+            shooter = random.choice(enemies)
+            origin = enemy_rect(shooter)
+            enemy_bullets.append({"x": float(origin.centerx), "y": float(origin.bottom)})
+            last_enemy_shot_at = now + random.randint(-120, 160)
+
+    active = []
+    player_was_hit = False
+    for shot in enemy_bullets:
+        shot["y"] += ENEMY_BULLET_SPEED
+        rect = pygame.Rect(round(shot["x"] - 3), round(shot["y"]), 6, 16)
+        if rect.colliderect(ship_rect) and now >= invincible_until:
+            player_was_hit = True
+        elif shot["y"] < HEIGHT - 28:
+            active.append(shot)
+    enemy_bullets[:] = active
+    if player_was_hit:
+        hit_player(now, False)
+
+
+def draw_enemy_bullets():
+    for shot in enemy_bullets:
+        x, y = round(shot["x"]), round(shot["y"])
+        pygame.draw.rect(screen, RED, (x - 3, y, 6, 14))
+        pygame.draw.rect(screen, YELLOW, (x - 1, y + 3, 2, 7))
 
 
 def draw_powerups():
@@ -396,7 +451,9 @@ def destroy_enemies_at_impact(direct_hit, center, explosive, now):
 
     for enemy in defeated:
         enemies.remove(enemy)
-        add_explosion(enemy_rect(enemy).center, now)
+        defeated_center = enemy_rect(enemy).center
+        add_explosion(defeated_center, now)
+        floating_texts.append({"text": "+10", "center": defeated_center, "start": now})
         score += 10
 
     if explosive:
@@ -404,14 +461,47 @@ def destroy_enemies_at_impact(direct_hit, center, explosive, now):
     return len(defeated)
 
 
-def lose_life():
+def draw_floating_texts(now):
+    active = []
+    for item in floating_texts:
+        elapsed = now - item["start"]
+        if elapsed < 720:
+            progress = elapsed / 720
+            label = font_small.render(item["text"], True, YELLOW)
+            label.set_alpha(round(255 * (1 - progress)))
+            x, y = item["center"]
+            screen.blit(label, label.get_rect(center=(x, y - round(progress * 38))))
+            active.append(item)
+    floating_texts[:] = active
+
+
+def update_music_tension(now):
+    """Añade un pulso al soundtrack cuya frecuencia aumenta al caer enemigos."""
+    global next_tension_beat
+    if not enemies:
+        return
+    remaining_ratio = len(enemies) / max(1, wave_enemy_count)
+    interval = 180 + round(remaining_ratio * 620)
+    if now >= next_tension_beat:
+        tension_sound.play()
+        next_tension_beat = now + interval
+
+
+def hit_player(now, formation_breached):
     global lives, bullet_state, bullet_y, bullet_explosive, game_state
+    global invincible_until, shake_until, player_center_x
+    if now < invincible_until:
+        return
     lives -= 1
     bullet_state, bullet_y = "ready", 480
     bullet_explosive = False
+    enemy_bullets.clear()
+    invincible_until = now + PLAYER_INVINCIBILITY_MS
+    shake_until = now + SHAKE_DURATION_MS
+    player_center_x = WIDTH // 2
     if lives <= 0:
         game_state = "game_over"
-    else:
+    elif formation_breached:
         create_wave()
 
 
@@ -475,7 +565,11 @@ while running:
 
         update_powerups(now, player_rect(now))
         if update_enemies():
-            lose_life()
+            hit_player(now, True)
+
+        if game_state == "playing":
+            update_enemy_attack(now, player_rect(now))
+            update_music_tension(now)
 
         if bullet_state == "fire":
             bullet_y -= bullet_speed
@@ -497,10 +591,12 @@ while running:
 
     draw_powerups()
     draw_enemies()
+    draw_enemy_bullets()
     if bullet_state == "fire":
         draw_bullet()
     draw_explosions(now)
     draw_blasts(now)
+    draw_floating_texts(now)
     draw_player(now)
 
     if game_state == "level_clear":
@@ -510,6 +606,12 @@ while running:
 
     draw_hud(now)
     draw_footer()
+
+    if now < shake_until:
+        snapshot = screen.copy()
+        offset = (random.randint(-7, 7), random.randint(-5, 5))
+        screen.fill(DARK)
+        screen.blit(snapshot, offset)
     pygame.display.flip()
 
 pygame.quit()
